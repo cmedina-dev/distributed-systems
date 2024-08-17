@@ -9,6 +9,7 @@ import (
 	"hash/crc32"
 	"log"
 	"slices"
+	"time"
 )
 
 type MessageStore struct {
@@ -33,31 +34,46 @@ func main() {
 		5. Neighbors check own store for equivalency. If not equal, repeat step 4.
 	*/
 
-	n.Handle("syn", func(msg maelstrom.Message) error {
+	// Heartbeat every 2 seconds to reconcile differences in neighbors
+	go func() {
+		tick := time.NewTicker(3000 * time.Millisecond)
+		defer tick.Stop()
+
+		for range tick.C {
+			if len(neighbors) == 0 {
+				continue
+			}
+			curNode := n.ID()
+			neighborNodes := neighbors[curNode].([]interface{})
+			heartbeat := make(map[string]any)
+			heartbeat["type"] = "heartbeat"
+			heartbeat["checksum"], _ = getChecksum(messages.store)
+			for _, node := range neighborNodes {
+				err := n.Send(node.(string), heartbeat)
+				if err != nil {
+					log.Fatal("Error sending heartbeat: ", err)
+				}
+			}
+		}
+	}()
+
+	n.Handle("reconcile", func(msg maelstrom.Message) error {
 		var body map[string]any
 		err := json.Unmarshal(msg.Body, &body)
 		if err != nil {
 			return err
 		}
-
-		for _, message := range body["store"].([]interface{}) {
-			if !slices.Contains(messages.store, message.(float64)) {
-				messages.store = append(messages.store, message.(float64))
+		if body["store"] != nil {
+			for _, message := range body["store"].([]interface{}) {
+				if !slices.Contains(messages.store, message.(float64)) {
+					messages.store = append(messages.store, message.(float64))
+				}
 			}
-		}
-
-		res := map[string]any{
-			"type":  "refresh",
-			"store": messages.store,
-		}
-		err = n.Send(msg.Src, res)
-		if err != nil {
-			return err
 		}
 		return nil
 	})
 
-	n.Handle("refresh", func(msg maelstrom.Message) error {
+	n.Handle("heartbeat", func(msg maelstrom.Message) error {
 		var body map[string]any
 		err := json.Unmarshal(msg.Body, &body)
 		curNode := n.ID()
@@ -65,25 +81,20 @@ func main() {
 		if err != nil {
 			return err
 		}
-
-		for _, message := range body["store"].([]interface{}) {
-			if !slices.Contains(messages.store, message.(float64)) {
-				messages.store = append(messages.store, message.(float64))
-			}
-		}
-
-		refreshBody := map[string]any{
-			"type":  "refresh",
-			"store": messages.store,
-		}
-		for _, node := range neighborNodes {
-			if node != msg.Src {
-				err := n.Send(node.(string), refreshBody)
+		originChecksum := body["checksum"].(string)
+		curNodeChecksum, _ := getChecksum(messages.store)
+		if originChecksum != curNodeChecksum {
+			reconcile := make(map[string]any)
+			reconcile["type"] = "reconcile"
+			reconcile["store"] = messages.store
+			for _, node := range neighborNodes {
+				err := n.Send(node.(string), reconcile)
 				if err != nil {
 					return err
 				}
 			}
 		}
+
 		return nil
 	})
 
@@ -98,6 +109,14 @@ func main() {
 		messageID := body["message"].(float64)
 		checksum, _ := getChecksum(messages.store)
 
+		if body["store"] != nil {
+			for _, message := range body["store"].([]interface{}) {
+				if !slices.Contains(messages.store, message.(float64)) {
+					messages.store = append(messages.store, message.(float64))
+				}
+			}
+		}
+
 		// Tell node to propagate new value to neighbors
 		if !slices.Contains(messages.store, messageID) {
 			messages.store = append(messages.store, messageID)
@@ -107,22 +126,17 @@ func main() {
 			broadcast["message"] = messageID
 			broadcast["checksum"] = checksum
 
+			if body["checksum"] != nil && body["checksum"] != checksum {
+				broadcast["store"] = messages.store
+			} else {
+				broadcast["store"] = nil
+			}
+
 			for _, node := range neighborNodes {
 				err := n.Send(node.(string), broadcast)
 				if err != nil {
 					return err
 				}
-			}
-		}
-
-		if body["checksum"] != nil && body["checksum"] != checksum {
-			res := map[string]any{
-				"type":  "syn",
-				"store": messages.store,
-			}
-			err := n.Send(msg.Src, res)
-			if err != nil {
-				return err
 			}
 		}
 
