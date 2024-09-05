@@ -1,203 +1,315 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
-	"hash/crc32"
 	"log"
-	"slices"
+	"math"
+	"math/rand"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type MessageStore struct {
-	store []float64
+	mu       sync.RWMutex
+	store    []float64
+	storeSet map[float64]struct{}
+	batch    []float64
 }
 
-/*
-1. Checksum is broadcast to node
-2. Node's existing checksum does not match, sends `syn` message to node
-3. Node receives `syn` message, tells sending node to broadcast its message store
-*/
-func main() {
-	n := maelstrom.NewNode()
-	messages := MessageStore{}
-	neighbors := make(map[string]interface{})
+type VectorClock struct {
+	mu    sync.RWMutex
+	clock map[string]*atomic.Uint64
+}
 
-	/*
-		1. Broadcast received by node
-		2. Receiving node checks CRC hash of sender
-		3. If hash exists and does not match, tell sender to send data store (`syn`) and receiver sends own data store
-		4. Sender sends back full data store to receiver, sender passes receiver's data store to neighbors
-		5. Neighbors check own store for equivalency. If not equal, repeat step 4.
-	*/
+type MaelstromNode struct {
+	n           *maelstrom.Node
+	messages    MessageStore
+	peers       []string
+	vectorClock VectorClock
+}
 
-	// Heartbeat every 2 seconds to reconcile differences in neighbors
-	go func() {
-		tick := time.NewTicker(3000 * time.Millisecond)
-		defer tick.Stop()
+func getRandomPeers(peers []string) []string {
+	length := len(peers)
+	if length == 0 {
+		return nil
+	}
+	selectedPeers := make([]string, 0)
+	selectedPeersSet := make(map[int]struct{})
+	selectedPeerCount := math.Floor(float64(length) / 2)
+	if selectedPeerCount == 0 {
+		selectedPeerCount = 1
+	}
+	for len(selectedPeers) < int(selectedPeerCount) {
+		peer := rand.Intn(length)
+		if _, exists := selectedPeersSet[peer]; !exists {
+			selectedPeers = append(selectedPeers, peers[peer])
+			selectedPeersSet[peer] = struct{}{}
+		}
+	}
+	return selectedPeers
+}
 
-		for range tick.C {
-			if len(neighbors) == 0 {
-				continue
+func (m *MaelstromNode) pull(nodeName string, version uint64) {
+	msg := map[string]any{}
+	msg["type"] = "pull"
+	msg["version"] = version
+	_ = m.n.RPC(nodeName, msg, func(res maelstrom.Message) error {
+		var body map[string]any
+		if err := json.Unmarshal(res.Body, &body); err != nil {
+			return nil
+		}
+		store := body["message"].([]interface{})
+		m.messages.mu.Lock()
+		for _, v := range store {
+			messageID := v.(float64)
+			if _, exists := m.messages.storeSet[messageID]; !exists {
+				m.messages.store = append(m.messages.store, messageID)
+				m.messages.storeSet[messageID] = struct{}{}
 			}
-			curNode := n.ID()
-			neighborNodes := neighbors[curNode].([]interface{})
-			heartbeat := make(map[string]any)
-			heartbeat["type"] = "heartbeat"
-			heartbeat["checksum"], _ = getChecksum(messages.store)
-			for _, node := range neighborNodes {
-				err := n.Send(node.(string), heartbeat)
-				if err != nil {
-					log.Fatal("Error sending heartbeat: ", err)
+		}
+		m.messages.mu.Unlock()
+		return nil
+	})
+}
+
+func (m *MaelstromNode) pullAll() {
+	peers := m.peers
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			msg := map[string]any{}
+			msg["type"] = "pull"
+			// Load the peer's vector version and retrieve the peer node's deltas
+			msg["version"] = float64(m.vectorClock.clock[peer].Load())
+			// Use async RPC to prevent blocking, lower message count, and improve latency
+			_ = m.n.RPC(p, msg, func(res maelstrom.Message) error {
+				var body map[string]any
+				if err := json.Unmarshal(res.Body, &body); err != nil {
+					return nil
 				}
+				store := body["message"].([]interface{})
+				m.messages.mu.Lock()
+				for _, v := range store {
+					messageID := v.(float64)
+					if _, exists := m.messages.storeSet[messageID]; !exists {
+						m.messages.store = append(m.messages.store, messageID)
+						m.messages.storeSet[messageID] = struct{}{}
+					}
+				}
+				m.messages.mu.Unlock()
+				return nil
+			})
+		}(peer)
+	}
+}
+
+// gossip distributes a given message to a list of the node's peers
+func (m *MaelstromNode) gossip(body map[string]any) {
+	peers := getRandomPeers(m.peers)
+	message := body["message"].(float64)
+	heartbeat := body["heartbeat"]
+	if heartbeat == nil {
+		heartbeat = float64(1)
+	}
+	if len(peers) == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			msg := map[string]any{}
+			msg["type"] = "broadcast"
+			msg["message"] = message
+			msg["heartbeat"] = heartbeat.(float64)
+			clockCopy := make(map[string]float64)
+			m.vectorClock.mu.RLock()
+			for k, v := range m.vectorClock.clock {
+				clockCopy[k] = float64(v.Load())
+			}
+			m.vectorClock.mu.RUnlock()
+			msg["clock"] = clockCopy
+			err := m.n.Send(p, msg)
+			if err != nil {
+				return
+			}
+		}(peer)
+	}
+}
+
+func main() {
+	node := MaelstromNode{
+		n: maelstrom.NewNode(),
+		messages: MessageStore{
+			store:    make([]float64, 0),
+			storeSet: make(map[float64]struct{}),
+			batch:    make([]float64, 0),
+		},
+		peers: make([]string, 0),
+		vectorClock: VectorClock{
+			clock: make(map[string]*atomic.Uint64),
+		},
+	}
+
+	// Periodically send out vector clock to confirm deltas with peers
+	ticker := time.NewTicker(125 * time.Millisecond)
+	done := make(chan bool)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case _ = <-ticker.C:
+				// Batch messaging to limit network overhead
+				for _, message := range node.messages.batch {
+					body := make(map[string]any)
+					clockCopy := make(map[string]float64)
+					node.vectorClock.mu.RLock()
+					for k, v := range node.vectorClock.clock {
+						clockCopy[k] = float64(v.Load())
+					}
+					node.vectorClock.mu.RUnlock()
+					body["clock"] = clockCopy
+					body["message"] = message
+					go node.gossip(body)
+				}
+				node.messages.batch = make([]float64, 0)
+				// Reconcile differences in versions
+				node.pullAll()
 			}
 		}
 	}()
 
-	n.Handle("reconcile", func(msg maelstrom.Message) error {
+	node.n.Handle("pull", func(msg maelstrom.Message) error {
 		var body map[string]any
-		err := json.Unmarshal(msg.Body, &body)
-		if err != nil {
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		if body["store"] != nil {
-			for _, message := range body["store"].([]interface{}) {
-				if !slices.Contains(messages.store, message.(float64)) {
-					messages.store = append(messages.store, message.(float64))
+		version := body["version"].(float64)
+		node.vectorClock.mu.RLock()
+		if _, ok := node.vectorClock.clock[node.n.ID()]; !ok {
+			node.vectorClock.mu.RUnlock()
+			return nil
+		}
+		if version == float64(node.vectorClock.clock[node.n.ID()].Load()) {
+			node.vectorClock.mu.RUnlock()
+			return nil
+		}
+		node.vectorClock.mu.RUnlock()
+		deltas := make([]float64, 0)
+		for i := int(version); i < len(node.messages.store); i++ {
+			deltas = append(deltas, node.messages.store[i])
+		}
+		node.messages.mu.RLock()
+		body["message"] = deltas
+		node.messages.mu.RUnlock()
+		return node.n.Reply(msg, body)
+	})
+
+	node.n.Handle("broadcast", func(msg maelstrom.Message) error {
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		if body["heartbeat"] != nil {
+			heartbeat := body["heartbeat"].(float64)
+			if heartbeat == 0 {
+				return nil
+			}
+			heartbeat -= 1
+			body["heartbeat"] = heartbeat
+		}
+		if body["clock"] != nil {
+			clock := body["clock"].(map[string]interface{})
+			for clockNodeName, clockNodeValue := range clock {
+				node.vectorClock.mu.RLock()
+				if _, exists := node.vectorClock.clock[clockNodeName]; exists {
+					clockFloat := uint64(clockNodeValue.(float64))
+					curNodeClockVal := node.vectorClock.clock[clockNodeName].Load()
+					node.vectorClock.mu.RUnlock()
+					if clockFloat > curNodeClockVal {
+						node.vectorClock.clock[clockNodeName].Swap(clockFloat)
+						// Because this is grow-only, we only need the difference in vector version between two nodes
+						// N1: { 3, 1, 0 }, N2: { 1, 1, 0 } means N2 needs to pull only the most recent two elements
+						if clockNodeName != msg.Src {
+							node.pull(clockNodeName, curNodeClockVal)
+						}
+					}
+				} else {
+					node.vectorClock.mu.RUnlock()
+					node.vectorClock.mu.Lock()
+					node.vectorClock.clock[clockNodeName] = new(atomic.Uint64)
+					node.vectorClock.clock[clockNodeName].Store(uint64(clockNodeValue.(float64)))
+					node.vectorClock.mu.Unlock()
 				}
 			}
+			node.vectorClock.clock[node.n.ID()].Add(1)
+		}
+		message := body["message"].(float64)
+		res := map[string]any{}
+		res["type"] = "broadcast_ok"
+		node.messages.mu.RLock()
+		_, exists := node.messages.storeSet[message]
+		node.messages.mu.RUnlock()
+		if exists {
+			// This lowers the number of message transmissions
+			// because nodes should not handle broadcast_ok responses
+			if msg.Src[0] == 'c' {
+				return node.n.Reply(msg, res)
+			}
+			return nil
+		}
+
+		node.messages.mu.Lock()
+		node.messages.batch = append(node.messages.batch, message)
+		node.messages.store = append(node.messages.store, message)
+		node.messages.storeSet[message] = struct{}{}
+		node.messages.mu.Unlock()
+
+		if msg.Src[0] == 'c' {
+			return node.n.Reply(msg, res)
 		}
 		return nil
 	})
 
-	n.Handle("heartbeat", func(msg maelstrom.Message) error {
+	node.n.Handle("read", func(msg maelstrom.Message) error {
 		var body map[string]any
-		err := json.Unmarshal(msg.Body, &body)
-		curNode := n.ID()
-		neighborNodes := neighbors[curNode].([]interface{})
-		if err != nil {
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		originChecksum := body["checksum"].(string)
-		curNodeChecksum, _ := getChecksum(messages.store)
-		if originChecksum != curNodeChecksum {
-			reconcile := make(map[string]any)
-			reconcile["type"] = "reconcile"
-			reconcile["store"] = messages.store
-			for _, node := range neighborNodes {
-				err := n.Send(node.(string), reconcile)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
+		res := map[string]any{}
+		res["type"] = "read_ok"
+		node.messages.mu.RLock()
+		res["messages"] = node.messages.store
+		node.messages.mu.RUnlock()
+		return node.n.Reply(msg, res)
 	})
 
-	n.Handle("broadcast", func(msg maelstrom.Message) error {
+	node.n.Handle("topology", func(msg maelstrom.Message) error {
 		var body map[string]any
-		err := json.Unmarshal(msg.Body, &body)
-		curNode := n.ID()
-		neighborNodes := neighbors[curNode].([]interface{})
-		if err != nil {
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		messageID := body["message"].(float64)
-		checksum, _ := getChecksum(messages.store)
-
-		if body["store"] != nil {
-			for _, message := range body["store"].([]interface{}) {
-				if !slices.Contains(messages.store, message.(float64)) {
-					messages.store = append(messages.store, message.(float64))
-				}
-			}
+		topology := body["topology"].(map[string]interface{})[node.n.ID()].([]interface{})
+		node.peers = make([]string, len(topology))
+		for i, peer := range topology {
+			node.peers[i] = peer.(string)
+			node.vectorClock.clock[peer.(string)] = new(atomic.Uint64)
+			node.vectorClock.clock[peer.(string)].Store(0)
 		}
-
-		// Tell node to propagate new value to neighbors
-		if !slices.Contains(messages.store, messageID) {
-			messages.store = append(messages.store, messageID)
-			checksum, _ = getChecksum(messages.store)
-			broadcast := make(map[string]any)
-			broadcast["type"] = "broadcast"
-			broadcast["message"] = messageID
-			broadcast["checksum"] = checksum
-
-			if body["checksum"] != nil && body["checksum"] != checksum {
-				broadcast["store"] = messages.store
-			} else {
-				broadcast["store"] = nil
-			}
-
-			for _, node := range neighborNodes {
-				err := n.Send(node.(string), broadcast)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		res := map[string]any{
-			"type": "broadcast_ok",
-		}
-		return n.Reply(msg, res)
+		res := map[string]any{}
+		res["type"] = "topology_ok"
+		return node.n.Reply(msg, res)
 	})
 
-	n.Handle("read", func(msg maelstrom.Message) error {
-		var body map[string]any
-		err := json.Unmarshal(msg.Body, &body)
-		if err != nil {
-			return err
-		}
-		res := map[string]any{
-			"type":     "read_ok",
-			"messages": messages.store,
-		}
-		body["messages"] = messages.store
-		body["type"] = "read_ok"
-		return n.Reply(msg, res)
-	})
-
-	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body map[string]any
-		err := json.Unmarshal(msg.Body, &body)
-		if err != nil {
-			return err
-		}
-		topology := body["topology"].(map[string]interface{})
-		for k, v := range topology {
-			neighbors[k] = v
-		}
-		res := map[string]any{
-			"type": "topology_ok",
-		}
-		return n.Reply(msg, res)
-	})
-
-	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
-		return nil
-	})
-
-	err := n.Run()
+	err := node.n.Run()
 	if err != nil {
 		log.Fatal(err)
 	}
-}
-
-func getChecksum(store []float64) (string, error) {
-	buffer := new(bytes.Buffer)
-	for _, message := range store {
-		err := binary.Write(buffer, binary.BigEndian, message)
-		if err != nil {
-			return "", err
-		}
-	}
-	polyTable := crc32.MakeTable(crc32.IEEE)
-	byteSlice := buffer.Bytes()
-	checksum := crc32.Checksum(byteSlice, polyTable)
-	state := fmt.Sprintf("%08x", checksum)
-	return state, nil
 }
