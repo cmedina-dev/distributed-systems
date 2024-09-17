@@ -158,7 +158,7 @@ func main() {
 	}
 
 	// Periodically send out vector clock to confirm deltas with peers
-	ticker := time.NewTicker(125 * time.Millisecond)
+	ticker := time.NewTicker(400 * time.Millisecond)
 	done := make(chan bool)
 	go func() {
 		for {
